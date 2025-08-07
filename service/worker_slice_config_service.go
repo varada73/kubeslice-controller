@@ -49,6 +49,7 @@ type IWorkerSliceConfigService interface {
 // WorkerSliceConfigService implements the IWorkerSliceConfigService interface
 type WorkerSliceConfigService struct {
 	mf metrics.IMetricRecorder
+	
 }
 
 // ReconcileWorkerSliceConfig is a function to reconcile the config of worker slice
@@ -324,7 +325,7 @@ func (s *WorkerSliceConfigService) CreateMinimalWorkerSliceConfig(ctx context.Co
 			return clusterMap, err
 		}
 		ipamOctet := clusterMap[cluster]
-		clusterSubnetCIDR := util.GetClusterPrefixPool(sliceSubnet, ipamOctet, clusterCidr)
+		//clusterSubnetCIDR := util.GetClusterPrefixPool(sliceSubnet, ipamOctet, clusterCidr)
 		// determine gw svc type
 		sliceGwSvcType := defaultSliceGatewayServiceType
 		sliceGwSvcProtocol := defaultSliceGatewayServiceProtocol
@@ -351,7 +352,7 @@ func (s *WorkerSliceConfigService) CreateMinimalWorkerSliceConfig(ctx context.Co
 			}
 			expectedSlice.Spec.SliceName = name
 			expectedSlice.Spec.Octet = &ipamOctet
-			expectedSlice.Spec.ClusterSubnetCIDR = clusterSubnetCIDR
+			//expectedSlice.Spec.ClusterSubnetCIDR = clusterSubnetCIDR
 			expectedSlice.Spec.SliceSubnet = sliceSubnet
 			expectedSlice.Spec.SliceGatewayProvider.SliceGatewayServiceType = sliceGwSvcType
 			expectedSlice.Spec.SliceGatewayProvider.SliceGatewayProtocol = sliceGwSvcProtocol
@@ -386,7 +387,7 @@ func (s *WorkerSliceConfigService) CreateMinimalWorkerSliceConfig(ctx context.Co
 		} else {
 			existingSlice.UID = ""
 			existingSlice.Spec.Octet = &ipamOctet
-			existingSlice.Spec.ClusterSubnetCIDR = clusterSubnetCIDR
+			//existingSlice.Spec.ClusterSubnetCIDR = clusterSubnetCIDR
 			existingSlice.Spec.SliceGatewayProvider.SliceGatewayServiceType = sliceGwSvcType
 			existingSlice.Spec.SliceGatewayProvider.SliceGatewayProtocol = sliceGwSvcProtocol
 			logger.Debug("updating slice with new octet", existingSlice)

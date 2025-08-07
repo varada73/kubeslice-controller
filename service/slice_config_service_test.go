@@ -698,6 +698,51 @@ func SliceConfigErrorOnCreateOrUpdateServiceImport(t *testing.T) {
 	mMock.AssertExpectations(t)
 }
 
+// NEW FUNCTION TO TEST IPAM ALLOCATOR
+func TestReconcileConfigWithIPAMAllocator(t *testing.T) {
+	workerSliceGatewayMock, workerSliceConfigMock, serviceExportConfigMock, workerServiceImportMock, workerSliceGatewayRecyclerMock, ipamMock, vpnMock, sliceConfigService, requestObj, clientMock, sliceConfig, ctx, mMock := setupSliceConfigTest("test-slice", "test-namespace")
+
+	sliceConfig.Name = "test-slice"
+	sliceConfig.Spec.SliceSubnet = "10.0.0.0/16"
+	sliceConfig.Spec.Clusters = []string{"test-cluster-1"}
+
+	// Mock the InitializePool call on the IPAMAllocator, which is the new logic we are testing.
+	ipamMock.On("InitializePool", sliceConfig.Name, sliceConfig.Spec.SliceSubnet).Return(nil).Once()
+
+	// Mock the common client operations that the Reconcile function will perform.
+	clientMock.On("Get", ctx, requestObj.NamespacedName, sliceConfig).Return(nil).Once()
+	clientMock.On("List", ctx, mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
+
+	// Mock the internal service calls that ReconcileSliceConfig depends on.
+	workerSliceConfigMock.On("ReconcileWorkerSliceConfigs", ctx, mock.Anything, "test-namespace", mock.Anything).Return(ctrl.Result{}, nil).Once()
+	workerSliceGatewayMock.On("ReconcileWorkerSliceGateways", ctx, mock.Anything, "test-namespace", mock.Anything).Return(ctrl.Result{}, nil).Once()
+	serviceExportConfigMock.On("ReconcileServiceExportConfigs", ctx, mock.Anything, "test-namespace", mock.Anything).Return(ctrl.Result{}, nil).Once()
+	workerServiceImportMock.On("ReconcileWorkerServiceImports", ctx, mock.Anything, "test-namespace", mock.Anything).Return(ctrl.Result{}, nil).Once()
+	workerSliceGatewayRecyclerMock.On("ReconcileWorkerSliceGatewayRecycler", ctx, mock.Anything).Return(nil).Once()
+	vpnMock.On("ReconcileClusters", ctx, mock.Anything, mock.Anything, mock.Anything).Return(nil, nil).Once()
+
+	// Mock metric reporting.
+	mMock.On("WithProject", mock.AnythingOfType("string")).Return(mMock).Once()
+
+	// Execute the function being tested.
+	result, err := sliceConfigService.ReconcileSliceConfig(ctx, requestObj)
+
+	// Assertions for the outcome of the function.
+	require.NoError(t, err)
+	require.False(t, result.Requeue)
+
+	// Assert that all mock expectations were met.
+	clientMock.AssertExpectations(t)
+	workerSliceConfigMock.AssertExpectations(t)
+	workerSliceGatewayMock.AssertExpectations(t)
+	serviceExportConfigMock.AssertExpectations(t)
+	workerServiceImportMock.AssertExpectations(t)
+	workerSliceGatewayRecyclerMock.AssertExpectations(t)
+	ipamMock.AssertExpectations(t)
+	vpnMock.AssertExpectations(t)
+	mMock.AssertExpectations(t)
+}
+
 func setupSliceConfigTest(name string, namespace string) (*mocks.IWorkerSliceGatewayService, *mocks.IWorkerSliceConfigService, *mocks.IServiceExportConfigService, *mocks.IWorkerServiceImportService, *mocks.IWorkerSliceGatewayRecyclerService, *utilMock.Client, *controllerv1alpha1.SliceConfig, context.Context, SliceConfigService, ctrl.Request, *metricMock.IMetricRecorder) {
 	workerSliceGatewayMock := &mocks.IWorkerSliceGatewayService{}
 	workerSliceConfigMock := &mocks.IWorkerSliceConfigService{}
@@ -706,14 +751,16 @@ func setupSliceConfigTest(name string, namespace string) (*mocks.IWorkerSliceGat
 	workerSliceGatewayRecyclerMock := &mocks.IWorkerSliceGatewayRecyclerService{}
 	mMock := &metricMock.IMetricRecorder{}
 	vpn := mocks.IVpnKeyRotationService{}
+	ipamMock := &mocks.IPAMAllocator{}
 	sliceConfigService := SliceConfigService{
-		sgs:   workerSliceGatewayMock,
-		ms:    workerSliceConfigMock,
-		se:    serviceExportConfigMock,
-		si:    workerServiceImportMock,
-		wsgrs: workerSliceGatewayRecyclerMock,
-		mf:    mMock,
-		vpn:   &vpn,
+		sgs:           workerSliceGatewayMock,
+		ms:            workerSliceConfigMock,
+		se:            serviceExportConfigMock,
+		si:            workerServiceImportMock,
+		wsgrs:         workerSliceGatewayRecyclerMock,
+		mf:            mMock,
+		vpn:           &vpn,
+		IPAMAllocator: ipamMock,
 	}
 	namespacedName := types.NamespacedName{
 		Name:      name,
@@ -735,5 +782,6 @@ func setupSliceConfigTest(name string, namespace string) (*mocks.IWorkerSliceGat
 	vpn.On("CreateMinimalVpnKeyRotationConfig", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	vpn.On("ReconcileClusters", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
 	ctx := util.PrepareKubeSliceControllersRequestContext(context.Background(), clientMock, scheme, "SliceConfigServiceTest", &eventRecorder)
-	return workerSliceGatewayMock, workerSliceConfigMock, serviceExportConfigMock, workerServiceImportMock, workerSliceGatewayRecyclerMock, clientMock, sliceConfig, ctx, sliceConfigService, requestObj, mMock
+	// Set up the mock expectation before returning
+	return workerSliceGatewayMock, workerSliceConfigMock, serviceExportConfigMock, workerServiceImportMock, workerSliceGatewayRecyclerMock, ipamMock, clientMock, sliceConfig, ctx, sliceConfigService, requestObj, mMock
 }

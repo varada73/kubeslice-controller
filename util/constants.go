@@ -42,3 +42,4 @@ const ProjectKind = "Project"
 const (
 	LabelValueResourceOwner = "kubeslice-controller"
 )
+const ClusterSubnetSizeAnnotation = "kubeslice.io/cluster-subnet-cidr-size"

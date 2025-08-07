@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,16 +54,17 @@ type IWorkerSliceGatewayService interface {
 	GenerateCerts(ctx context.Context, sliceName, namespace, gatewayProtocol string,
 		serverGateway *v1alpha1.WorkerSliceGateway, clientGateway *v1alpha1.WorkerSliceGateway,
 		gatewayAddresses util.WorkerSliceGatewayNetworkAddresses) error
-	BuildNetworkAddresses(sliceSubnet, sourceClusterName, destinationClusterName string,
-		clusterMap map[string]int, clusterCidr string) util.WorkerSliceGatewayNetworkAddresses
+	BuildNetworkAddresses(ctx context.Context, sliceName string, sliceSubnet string, sourceClusterName string, destinationClusterName string,
+		clusterMap map[string]int, clusterCidr string, sourceRequiredCIDRSize int, destinationRequiredCIDRSize int) util.WorkerSliceGatewayNetworkAddresses
 }
 
 // WorkerSliceGatewayService is a schema for interfaces JobService, WorkerSliceConfigService, SecretService
 type WorkerSliceGatewayService struct {
-	js   IJobService
-	sscs IWorkerSliceConfigService
-	sc   ISecretService
-	mf   metrics.IMetricRecorder
+	js            IJobService
+	sscs          IWorkerSliceConfigService
+	sc            ISecretService
+	mf            metrics.IMetricRecorder
+	IPAMAllocator IPAMAllocator
 }
 
 // WorkerSliceGatewayNetworkAddresses is a schema for WorkerSlice gateway network parameters
@@ -406,6 +408,18 @@ func (s *WorkerSliceGatewayService) cleanupObsoleteGateways(ctx context.Context,
 		clusterDestination := gateway.Spec.RemoteGatewayConfig.ClusterName
 		gatewayExpectedNumber := s.calculateGatewayNumber(clusterMap[clusterSource], clusterMap[clusterDestination])
 		if !clusterExistMap[clusterSource] || !clusterExistMap[clusterDestination] || gatewayExpectedNumber != gateway.Spec.GatewayNumber {
+			if gateway.Spec.LocalGatewayConfig.GatewaySubnet != "" {
+				err := s.IPAMAllocator.Reclaim(ctx, sliceName, clusterSource)
+				if err != nil {
+					logger.Error(err, "Failed to reclaim subnet for source cluster during gateway cleanup", "slice", sliceName, "cluster", clusterSource, "subnet", gateway.Spec.LocalGatewayConfig.GatewaySubnet)
+				}
+			}
+			if gateway.Spec.RemoteGatewayConfig.GatewaySubnet != "" {
+				err := s.IPAMAllocator.Reclaim(ctx, sliceName, clusterDestination)
+				if err != nil {
+					logger.Error(err, "Failed to reclaim subnet for destination cluster during gateway cleanup", "slice", sliceName, "cluster", clusterDestination, "subnet", gateway.Spec.RemoteGatewayConfig.GatewaySubnet)
+				}
+			}
 			err = util.DeleteResource(ctx, &gateway)
 			if err != nil {
 				//Register an event for worker slice gateway deletion failure
@@ -454,7 +468,33 @@ func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(ctx context
 		for j := i + 1; j < noClusters; j++ {
 			sourceCluster, destinationCluster := clusterMapping[clusterNames[i]], clusterMapping[clusterNames[j]]
 			gatewayNumber := s.calculateGatewayNumber(clusterMap[sourceCluster.Name], clusterMap[destinationCluster.Name])
-			gatewayAddresses := s.BuildNetworkAddresses(sliceSubnet, sourceCluster.Name, destinationCluster.Name, clusterMap, clusterCidr)
+			sourceRequiredCIDRSize, err := parseClusterSubnetSizeAnnotation(sourceCluster)
+			if err != nil {
+				logger.Error(err, "Failed to parse subnet size annotation for source cluster", "cluster", sourceCluster.Name)
+				defaultSizeStr := strings.TrimPrefix(clusterCidr, "/")
+				defaultSize, parseErr := strconv.Atoi(defaultSizeStr)
+				if parseErr != nil {
+					logger.Error(parseErr, "Invalid default clusterCidr format, falling back to /24", "clusterCidr", clusterCidr)
+					sourceRequiredCIDRSize = 24
+				} else {
+					sourceRequiredCIDRSize = defaultSize
+				}
+			}
+			destinationRequiredCIDRSize, err := parseClusterSubnetSizeAnnotation(destinationCluster)
+			if err != nil {
+				logger.Error(err, "Failed to parse subnet size annotation for destination cluster", "cluster", destinationCluster.Name)
+
+				defaultSizeStr := strings.TrimPrefix(clusterCidr, "/")
+				defaultSize, parseErr := strconv.Atoi(defaultSizeStr)
+				if parseErr != nil {
+					logger.Error(parseErr, "Invalid default clusterCidr format, falling back to /24", "clusterCidr", clusterCidr)
+					destinationRequiredCIDRSize = 24
+				} else {
+					destinationRequiredCIDRSize = defaultSize
+				}
+			}
+			gatewayAddresses := s.BuildNetworkAddresses(ctx, sliceName, sliceSubnet, sourceCluster.Name, destinationCluster.Name, clusterMap, clusterCidr, sourceRequiredCIDRSize, destinationRequiredCIDRSize)
+
 			// determine the gateway svc parameters
 			sliceGwSvcType := defaultSliceGatewayServiceType
 			gwSvcProtocol := defaultSliceGatewayServiceProtocol
@@ -464,7 +504,7 @@ func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(ctx context
 			}
 			logger.Debugf("setting gwConType in create_minwsg %s", sliceGwSvcType)
 			logger.Debugf("setting gwProto in create_minwsg %s", gwSvcProtocol)
-			err := s.createMinimumGateWayPairIfNotExists(ctx, sourceCluster, destinationCluster, sliceName, namespace, sliceGwSvcType, gwSvcProtocol, ownerLabel, gatewayNumber, gatewayAddresses)
+			err = s.createMinimumGateWayPairIfNotExists(ctx, sourceCluster, destinationCluster, sliceName, namespace, sliceGwSvcType, gwSvcProtocol, ownerLabel, gatewayNumber, gatewayAddresses)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -573,21 +613,47 @@ func (s *WorkerSliceGatewayService) createMinimumGateWayPairIfNotExists(ctx cont
 
 	return nil
 }
+func parseClusterSubnetSizeAnnotation(cluster *controllerv1alpha1.Cluster) (int, error) {
+	if cluster.Annotations == nil {
+		return 0, fmt.Errorf("cluster %s has no annotations", cluster.Name)
+	}
+	sizeStr, ok := cluster.Annotations[util.ClusterSubnetSizeAnnotation]
+	if !ok {
+		return 0, fmt.Errorf("cluster %s missing annotation %s", cluster.Name, util.ClusterSubnetSizeAnnotation)
+	}
+	size, err := strconv.Atoi(sizeStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid subnet CIDR size annotation %s for cluster %s: %w", sizeStr, cluster.Name, err)
+	}
+	// Validate the size is within the acceptable range for CIDR notation
+	if size < 1 || size > 30 {
+		return 0, fmt.Errorf("invalid CIDR size %d for cluster %s, must be between 1 and 30", size, cluster.Name)
+	}
+	return size, nil
+}
 
 // buildNetworkAddresses - function generates the object of WorkerSliceGatewayNetworkAddresses
-func (s *WorkerSliceGatewayService) BuildNetworkAddresses(sliceSubnet, sourceClusterName, destinationClusterName string,
-	clusterMap map[string]int, clusterCidr string) util.WorkerSliceGatewayNetworkAddresses {
+func (s *WorkerSliceGatewayService) BuildNetworkAddresses(ctx context.Context, sliceName string, sliceSubnet string, sourceClusterName string, destinationClusterName string,
+	clusterMap map[string]int, clusterCidr string, sourceRequiredCIDRSize int, destinationRequiredCIDRSize int) util.WorkerSliceGatewayNetworkAddresses {
 	gatewayAddresses := util.WorkerSliceGatewayNetworkAddresses{}
 	ipr := strings.Split(sliceSubnet, ".")
-	serverSubnet := util.GetClusterPrefixPool(sliceSubnet, clusterMap[sourceClusterName], clusterCidr)
-	clientSubnet := util.GetClusterPrefixPool(sliceSubnet, clusterMap[destinationClusterName], clusterCidr)
+	serverSubnet, err := s.IPAMAllocator.Allocate(ctx, sliceName, sourceClusterName, sourceRequiredCIDRSize)
+	if err != nil {
+		logger.Error(err, "Failed to allocate server subnet from IPAM", "slice", sliceName, "cluster", sourceClusterName, "requiredCIDRSize", sourceRequiredCIDRSize)
+		return util.WorkerSliceGatewayNetworkAddresses{}
+	}
+	clientSubnet, err := s.IPAMAllocator.Allocate(ctx, sliceName, destinationClusterName, destinationRequiredCIDRSize)
+	if err != nil {
+		logger.Error(err, "Failed to allocate client subnet from IPAM", "slice", sliceName, "cluster", destinationClusterName, "requiredCIDRSize", destinationRequiredCIDRSize)
+		return util.WorkerSliceGatewayNetworkAddresses{}
+	}
 	gatewayAddresses.ServerNetwork = strings.SplitN(serverSubnet, "/", -1)[0]
 	gatewayAddresses.ClientNetwork = strings.SplitN(clientSubnet, "/", -1)[0]
 	gatewayAddresses.ServerSubnet = serverSubnet
 	gatewayAddresses.ClientSubnet = clientSubnet
-	gatewayAddresses.ServerVpnNetwork = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 255, "0")
-	gatewayAddresses.ServerVpnAddress = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 255, "1")
-	gatewayAddresses.ClientVpnAddress = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 255, "2")
+	gatewayAddresses.ServerVpnNetwork = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 0, "0")
+	gatewayAddresses.ServerVpnAddress = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 0, "1")
+	gatewayAddresses.ClientVpnAddress = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 0, "2")
 	return gatewayAddresses
 }
 

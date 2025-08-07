@@ -105,17 +105,19 @@ func WithSliceConfigService(
 	wsgrs IWorkerSliceGatewayRecyclerService,
 	mf metrics.IMetricRecorder,
 	vpn IVpnKeyRotationService,
+	ipamAllocator IPAMAllocator,
 ) ISliceConfigService {
 	return &SliceConfigService{
-		ns:    ns,
-		acs:   acs,
-		sgs:   sgs,
-		ms:    ms,
-		si:    si,
-		se:    se,
-		wsgrs: wsgrs,
-		mf:    mf,
-		vpn:   vpn,
+		ns:            ns,
+		acs:           acs,
+		sgs:           sgs,
+		ms:            ms,
+		si:            si,
+		se:            se,
+		wsgrs:         wsgrs,
+		mf:            mf,
+		vpn:           vpn,
+		IPAMAllocator: ipamAllocator,
 	}
 }
 
@@ -156,12 +158,14 @@ func WithWorkerSliceGatewayService(
 	sscs IWorkerSliceConfigService,
 	sc ISecretService,
 	mf metrics.IMetricRecorder,
+	ipamAllocator IPAMAllocator,
 ) IWorkerSliceGatewayService {
 	return &WorkerSliceGatewayService{
-		js:   js,
-		sscs: sscs,
-		sc:   sc,
-		mf:   mf,
+		js:            js,
+		sscs:          sscs,
+		sc:            sc,
+		mf:            mf,
+		IPAMAllocator: ipamAllocator,
 	}
 }
 

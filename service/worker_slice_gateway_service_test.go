@@ -248,7 +248,7 @@ func testWorkerSliceGatewayReconciliationDeleteForcefully(t *testing.T) {
 }
 
 func testCreateMinimumWorkerSliceGatewaysAlreadyExists(t *testing.T) {
-	_, _, _, workerSliceGatewayService, requestObj, clientMock, _, ctx, mMock := setupWorkerSliceGatewayTest("slice_gateway", "namespace")
+	_, _, _, workerSliceGatewayService, requestObj, clientMock, _, ctx, mMock, ipamMock := setupWorkerSliceGatewayTest("slice_gateway", "namespace")
 	label := map[string]string{
 		"worker-cluster": "cluster-1",
 		"remote-cluster": "cluster-2",
@@ -314,11 +314,35 @@ func testCreateMinimumWorkerSliceGatewaysAlreadyExists(t *testing.T) {
 	mMock.On("RecordCounterMetric", mock.Anything, mock.Anything).Return().Once()
 	cluster := &controllerv1alpha1.Cluster{}
 	clientMock.On("Get", ctx, mock.AnythingOfType("types.NamespacedName"), cluster).Return(nil).Twice()
+
+	//NEW TEST
+	cluster1 := &controllerv1alpha1.Cluster{}
+	cluster2 := &controllerv1alpha1.Cluster{}
+	clientMock.On("Get", ctx, types.NamespacedName{Name: "cluster-1", Namespace: "namespace"}, cluster1).Return(nil).Run(func(args mock.Arguments) {
+		arg := args.Get(2).(*controllerv1alpha1.Cluster)
+		arg.Name = "cluster-1"
+		arg.Annotations = map[string]string{util.ClusterSubnetSizeAnnotation: "28"} // Example annotation
+	}).Once()
+	clientMock.On("Get", ctx, types.NamespacedName{Name: "cluster-2", Namespace: "namespace"}, cluster2).Return(nil).Run(func(args mock.Arguments) {
+		arg := args.Get(2).(*controllerv1alpha1.Cluster)
+		arg.Name = "cluster-2"
+		arg.Annotations = map[string]string{util.ClusterSubnetSizeAnnotation: "28"} // Example annotation
+	}).Once()
+
 	gateway := &workerv1alpha1.WorkerSliceGateway{}
 	clientMock.On("Get", ctx, mock.AnythingOfType("types.NamespacedName"), gateway).Return(nil).Twice()
 	//clientMock.On("Create", ctx, gateway).Return(nil).Times(4)
 	//environment := make(map[string]string, 5)
 	//jobMock.On("CreateJob", ctx, requestObj.Namespace, "image", environment).Return(ctrl.Result{}, nil).Once()
+
+	// NEW: Mock IPAMAllocator.Allocate calls
+	ipamMock.On("Allocate", ctx, "red", "cluster-1", 28).Return("10.10.10.0/28", nil).Once()  // Source cluster allocation
+	ipamMock.On("Allocate", ctx, "red", "cluster-2", 28).Return("10.10.10.16/28", nil).Once() // Destination cluster allocation
+
+	// NEW: Mock IPAMAllocator.Reclaim calls (from cleanupObsoleteGateways)
+	// These will be called if there are obsolete gateways that need their IPs reclaimed.
+	ipamMock.On("Reclaim", ctx, "red", "cluster-1").Return(nil).Maybe()
+	ipamMock.On("Reclaim", ctx, "red", "cluster-2").Return(nil).Maybe()
 
 	result, err := workerSliceGatewayService.CreateMinimumWorkerSliceGateways(ctx, "red", clusterNames, requestObj.Namespace, label, clusterMap, "10.10.10.10/16", "/16", nil)
 	expectedResult := ctrl.Result{}
@@ -327,10 +351,11 @@ func testCreateMinimumWorkerSliceGatewaysAlreadyExists(t *testing.T) {
 	require.Nil(t, err)
 	clientMock.AssertExpectations(t)
 	mMock.AssertExpectations(t)
+	ipamMock.AssertExpectations(t)
 }
 
 func testCreateMinimumWorkerSliceGatewaysNotExists(t *testing.T) {
-	_, _, jobMock, workerSliceGatewayService, requestObj, clientMock, _, ctx, mMock := setupWorkerSliceGatewayTest("slice_gateway", "namespace")
+	_, _, jobMock, workerSliceGatewayService, requestObj, clientMock, _, ctx, mMock, ipamMock := setupWorkerSliceGatewayTest("slice_gateway", "namespace")
 	label := map[string]string{
 		"worker-cluster": "cluster-1",
 		"remote-cluster": "cluster-2",
@@ -394,6 +419,20 @@ func testCreateMinimumWorkerSliceGatewaysNotExists(t *testing.T) {
 	mMock.On("RecordCounterMetric", mock.Anything, mock.Anything).Return().Twice()
 	cluster := &controllerv1alpha1.Cluster{}
 	clientMock.On("Get", ctx, mock.AnythingOfType("types.NamespacedName"), cluster).Return(nil).Twice()
+	//NEW TEST
+	cluster1 := &controllerv1alpha1.Cluster{}
+	cluster2 := &controllerv1alpha1.Cluster{}
+	clientMock.On("Get", ctx, types.NamespacedName{Name: "cluster-1", Namespace: "namespace"}, cluster1).Return(nil).Run(func(args mock.Arguments) {
+		arg := args.Get(2).(*controllerv1alpha1.Cluster)
+		arg.Name = "cluster-1"
+		arg.Annotations = map[string]string{util.ClusterSubnetSizeAnnotation: "28"} // Example annotation
+	}).Once()
+	clientMock.On("Get", ctx, types.NamespacedName{Name: "cluster-2", Namespace: "namespace"}, cluster2).Return(nil).Run(func(args mock.Arguments) {
+		arg := args.Get(2).(*controllerv1alpha1.Cluster)
+		arg.Name = "cluster-2"
+		arg.Annotations = map[string]string{util.ClusterSubnetSizeAnnotation: "28"} // Example annotation
+	}).Once()
+
 	gateway := &workerv1alpha1.WorkerSliceGateway{}
 	notFoundError := k8sError.NewNotFound(schema.GroupResource{Group: "", Resource: "WorkerSliceTest"}, "isNotFound")
 	clientMock.On("Get", ctx, mock.AnythingOfType("types.NamespacedName"), gateway).Return(notFoundError).Once()
@@ -407,6 +446,15 @@ func testCreateMinimumWorkerSliceGatewaysNotExists(t *testing.T) {
 	clientMock.On("Update", ctx, mock.AnythingOfType("*v1.Event")).Return(nil).Once()
 	clientMock.On("Get", ctx, mock.Anything, mock.Anything).Return(nil).Once()
 	mMock.On("RecordCounterMetric", mock.Anything, mock.Anything).Return().Once()
+
+	// NEW: Mock IPAMAllocator.Allocate calls
+	ipamMock.On("Allocate", ctx, "red", "cluster-1", 28).Return("10.10.10.0/28", nil).Once()  // Source cluster allocation
+	ipamMock.On("Allocate", ctx, "red", "cluster-2", 28).Return("10.10.10.16/28", nil).Once() // Destination cluster allocation
+
+	// NEW: Mock IPAMAllocator.Reclaim calls (from cleanupObsoleteGateways)
+	ipamMock.On("Reclaim", ctx, "red", "cluster-1").Return(nil).Maybe()
+	ipamMock.On("Reclaim", ctx, "red", "cluster-2").Return(nil).Maybe()
+
 	result, err := workerSliceGatewayService.CreateMinimumWorkerSliceGateways(ctx, "red", clusterNames, requestObj.Namespace, label, clusterMap, "10.10.10.10/16", "/16", nil)
 	expectedResult := ctrl.Result{}
 	require.NoError(t, nil)
@@ -414,10 +462,11 @@ func testCreateMinimumWorkerSliceGatewaysNotExists(t *testing.T) {
 	require.Nil(t, err)
 	clientMock.AssertExpectations(t)
 	mMock.AssertExpectations(t)
+	ipamMock.AssertExpectations(t)
 }
 
 func testDeleteWorkerSliceGatewaysByLabelExists(t *testing.T) {
-	_, _, _, workerSliceGatewayService, requestObj, clientMock, _, ctx, mMock := setupWorkerSliceGatewayTest("slice_gateway", "namespace")
+	_, _, _, workerSliceGatewayService, requestObj, clientMock, _, ctx, mMock, ipamMock := setupWorkerSliceGatewayTest("slice_gateway", "namespace")
 	label := map[string]string{
 		"worker-cluster": "cluster-1",
 		"remote-cluster": "cluster-2",
@@ -428,8 +477,13 @@ func testDeleteWorkerSliceGatewaysByLabelExists(t *testing.T) {
 		arg := args.Get(1).(*workerv1alpha1.WorkerSliceGatewayList)
 		arg.Items = []workerv1alpha1.WorkerSliceGateway{
 			{
-				TypeMeta:   k8sapimachinery.TypeMeta{},
-				ObjectMeta: k8sapimachinery.ObjectMeta{},
+				TypeMeta: k8sapimachinery.TypeMeta{},
+				ObjectMeta: k8sapimachinery.ObjectMeta{
+					Labels: map[string]string{
+						"worker-cluster":      "cluster-1",
+						"remote-cluster":      "cluster-2",
+						"original-slice-name": "slice_gateway", // Important for reclaim
+					}},
 				Spec: workerv1alpha1.WorkerSliceGatewaySpec{
 					SliceName:          "",
 					GatewayType:        "",
@@ -441,16 +495,25 @@ func testDeleteWorkerSliceGatewaysByLabelExists(t *testing.T) {
 						GatewayName:   "",
 						ClusterName:   "cluster-1",
 						VpnIp:         "",
-						GatewaySubnet: "",
+						GatewaySubnet: "10.10.10.0/28",
 					},
-					RemoteGatewayConfig: workerv1alpha1.SliceGatewayConfig{},
-					GatewayNumber:       0,
+					RemoteGatewayConfig: workerv1alpha1.SliceGatewayConfig{
+						ClusterName:   "cluster-2",
+						GatewaySubnet: "10.10.10.16/28",
+					},
+					GatewayNumber: 0,
 				},
 				Status: workerv1alpha1.WorkerSliceGatewayStatus{},
 			},
 			{
-				TypeMeta:   k8sapimachinery.TypeMeta{},
-				ObjectMeta: k8sapimachinery.ObjectMeta{},
+				TypeMeta: k8sapimachinery.TypeMeta{},
+				ObjectMeta: k8sapimachinery.ObjectMeta{
+					Labels: map[string]string{
+						"worker-cluster":      "cluster-2",
+						"remote-cluster":      "cluster-1",
+						"original-slice-name": "slice_gateway", // Important for reclaim
+					},
+				},
 				Spec: workerv1alpha1.WorkerSliceGatewaySpec{
 					SliceName:          "",
 					GatewayType:        "",
@@ -462,10 +525,13 @@ func testDeleteWorkerSliceGatewaysByLabelExists(t *testing.T) {
 						GatewayName:   "",
 						ClusterName:   "cluster-2",
 						VpnIp:         "",
-						GatewaySubnet: "",
+						GatewaySubnet: "10.10.10.16/28",
 					},
-					RemoteGatewayConfig: workerv1alpha1.SliceGatewayConfig{},
-					GatewayNumber:       0,
+					RemoteGatewayConfig: workerv1alpha1.SliceGatewayConfig{
+						ClusterName:   "cluster-1",
+						GatewaySubnet: "10.10.10.0/28",
+					},
+					GatewayNumber: 0,
 				},
 				Status: workerv1alpha1.WorkerSliceGatewayStatus{},
 			},
@@ -476,11 +542,17 @@ func testDeleteWorkerSliceGatewaysByLabelExists(t *testing.T) {
 	mMock.On("RecordCounterMetric", mock.Anything, mock.Anything).Return().Once()
 	clientMock.On("Update", ctx, mock.AnythingOfType("*v1.Event")).Return(nil).Once()
 	mMock.On("RecordCounterMetric", mock.Anything, mock.Anything).Return().Once()
+
+	// NEW: Mock IPAMAllocator.Reclaim calls
+	ipamMock.On("Reclaim", ctx, "slice_gateway", "cluster-1").Return(nil).Once()
+	ipamMock.On("Reclaim", ctx, "slice_gateway", "cluster-2").Return(nil).Once()
+
 	err := workerSliceGatewayService.DeleteWorkerSliceGatewaysByLabel(ctx, label, "namespace")
 	require.NoError(t, nil)
 	require.Nil(t, err)
 	clientMock.AssertExpectations(t)
 	mMock.AssertExpectations(t)
+	ipamMock.AssertExpectations(t)
 }
 
 func testNodeIpReconciliationOfWorkerSliceGatewaysExists(t *testing.T) {
@@ -568,11 +640,13 @@ func setupWorkerSliceGatewayTest(name string, namespace string) (*mocks.ISecretS
 	workerSliceConfigMock := &mocks.IWorkerSliceConfigService{}
 	jobServiceMock := &mocks.IJobService{}
 	mMock := &metricMock.IMetricRecorder{}
+	ipamMock := &mocks.IPAMAllocator{}
 	workerSliceGatewayMock := WorkerSliceGatewayService{
-		js:   jobServiceMock,
-		sscs: workerSliceConfigMock,
-		sc:   secretServiceMock,
-		mf:   mMock,
+		js:            jobServiceMock,
+		sscs:          workerSliceConfigMock,
+		sc:            secretServiceMock,
+		mf:            mMock,
+		IPAMAllocator: ipamMock,
 	}
 	namespacedName := types.NamespacedName{
 		Name:      name,
@@ -593,5 +667,5 @@ func setupWorkerSliceGatewayTest(name string, namespace string) (*mocks.ISecretS
 	})
 	workerSliceGateway := &workerv1alpha1.WorkerSliceGateway{}
 	ctx := util.PrepareKubeSliceControllersRequestContext(context.Background(), clientMock, scheme, "WorkerSliceGatewayTest", &eventRecorder)
-	return secretServiceMock, workerSliceConfigMock, jobServiceMock, workerSliceGatewayMock, requestObj, clientMock, workerSliceGateway, ctx, mMock
+	return secretServiceMock, workerSliceConfigMock, jobServiceMock, workerSliceGatewayMock, requestObj, clientMock, workerSliceGateway, ctx, mMock, ipamMock
 }

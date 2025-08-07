@@ -59,6 +59,7 @@ func init() {
 
 func main() {
 	// Compile time dependency injection
+	dynamicIPAM := service.NewDynamicIPAMAllocator()
 	mr := service.WithMetricsRecorder()
 	ns := service.WithNameSpaceService(mr)
 	rp := service.WithAccessControlRuleProvider()
@@ -66,13 +67,13 @@ func main() {
 	js := service.WithJobService()
 	wscs := service.WithWorkerSliceConfigService(mr)
 	ss := service.WithSecretService(mr)
-	wsgs := service.WithWorkerSliceGatewayService(js, wscs, ss, mr)
+	wsgs := service.WithWorkerSliceGatewayService(js, wscs, ss, mr,dynamicIPAM)
 	c := service.WithClusterService(ns, acs, wsgs, mr)
 	wsi := service.WithWorkerServiceImportService(mr)
 	se := service.WithServiceExportConfigService(wsi, mr)
 	wsgrs := service.WithWorkerSliceGatewayRecyclerService()
 	vpn := service.WithVpnKeyRotationService(wsgs, wscs)
-	sc := service.WithSliceConfigService(ns, acs, wsgs, wscs, wsi, se, wsgrs, mr, vpn)
+	sc := service.WithSliceConfigService(ns, acs, wsgs, wscs, wsi, se, wsgrs, mr, vpn,dynamicIPAM)
 	sqcs := service.WithSliceQoSConfigService(wscs, mr)
 	p := service.WithProjectService(ns, acs, c, sc, se, sqcs, mr)
 	initialize(service.WithServices(wscs, p, c, sc, se, wsgs, wsi, sqcs, wsgrs, vpn))

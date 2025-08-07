@@ -49,6 +49,7 @@ type SliceConfigService struct {
 	wsgrs IWorkerSliceGatewayRecyclerService
 	mf    metrics.IMetricRecorder
 	vpn   IVpnKeyRotationService
+	IPAMAllocator IPAMAllocator
 }
 
 const NamespaceAndClusterFormat = "namespace=%s&cluster=%s"
@@ -67,6 +68,12 @@ func (s *SliceConfigService) ReconcileSliceConfig(ctx context.Context, req ctrl.
 		logger.Infof("sliceConfig %v not found, returning from  reconciler loop.", req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
+
+	err = s.IPAMAllocator.InitializePool(sliceConfig.Name, sliceConfig.Spec.SliceSubnet) 
+    if err != nil {
+        logger.Error(err, "Failed to initialize IPAM pool for slice", "slice", sliceConfig.Name, "subnet", sliceConfig.Spec.SliceSubnet)
+        return ctrl.Result{}, err 
+    }
 	// Load Event Recorder with project name, slice name and namespace
 	eventRecorder := util.CtxEventRecorder(ctx).
 		WithProject(util.GetProjectName(sliceConfig.Namespace)).
