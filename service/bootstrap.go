@@ -16,7 +16,10 @@
 
 package service
 
-import "github.com/kubeslice/kubeslice-controller/metrics"
+import (
+	"github.com/kubeslice/kubeslice-controller/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
 
 type Services struct {
 	ProjectService                    IProjectService
@@ -105,17 +108,21 @@ func WithSliceConfigService(
 	wsgrs IWorkerSliceGatewayRecyclerService,
 	mf metrics.IMetricRecorder,
 	vpn IVpnKeyRotationService,
+	cl client.Client,
 ) ISliceConfigService {
+	ipamAllocator := NewDynamicIPAMAllocator()
 	return &SliceConfigService{
-		ns:    ns,
-		acs:   acs,
-		sgs:   sgs,
-		ms:    ms,
-		si:    si,
-		se:    se,
-		wsgrs: wsgrs,
-		mf:    mf,
-		vpn:   vpn,
+		ns:     ns,
+		acs:    acs,
+		sgs:    sgs,
+		ms:     ms,
+		si:     si,
+		se:     se,
+		wsgrs:  wsgrs,
+		mf:     mf,
+		vpn:    vpn,
+		client: cl,
+		ipam:   ipamAllocator,
 	}
 }
 
@@ -156,12 +163,16 @@ func WithWorkerSliceGatewayService(
 	sscs IWorkerSliceConfigService,
 	sc ISecretService,
 	mf metrics.IMetricRecorder,
+	cl client.Client,
 ) IWorkerSliceGatewayService {
+	ipamAllocator := NewDynamicIPAMAllocator()
 	return &WorkerSliceGatewayService{
-		js:   js,
-		sscs: sscs,
-		sc:   sc,
-		mf:   mf,
+		js:     js,
+		sscs:   sscs,
+		sc:     sc,
+		mf:     mf,
+		ipam:   ipamAllocator,
+		client: cl,
 	}
 }
 

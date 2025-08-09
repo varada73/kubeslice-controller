@@ -40,15 +40,17 @@ type ISliceConfigService interface {
 
 // SliceConfigService implements different interfaces -
 type SliceConfigService struct {
-	ns    INamespaceService
-	acs   IAccessControlService
-	sgs   IWorkerSliceGatewayService
-	ms    IWorkerSliceConfigService
-	si    IWorkerServiceImportService
-	se    IServiceExportConfigService
-	wsgrs IWorkerSliceGatewayRecyclerService
-	mf    metrics.IMetricRecorder
-	vpn   IVpnKeyRotationService
+	ns     INamespaceService
+	acs    IAccessControlService
+	sgs    IWorkerSliceGatewayService
+	ms     IWorkerSliceConfigService
+	si     IWorkerServiceImportService
+	se     IServiceExportConfigService
+	wsgrs  IWorkerSliceGatewayRecyclerService
+	mf     metrics.IMetricRecorder
+	vpn    IVpnKeyRotationService
+	client client.Client
+	ipam   IPAMAllocator
 }
 
 const NamespaceAndClusterFormat = "namespace=%s&cluster=%s"
@@ -77,6 +79,29 @@ func (s *SliceConfigService) ReconcileSliceConfig(ctx context.Context, req ctrl.
 	s.mf.WithProject(util.GetProjectName(sliceConfig.Namespace)).
 		WithNamespace(sliceConfig.Namespace).
 		WithSlice(sliceConfig.Name)
+
+	sliceSubnet := sliceConfig.Spec.SliceSubnet
+	sliceName := sliceConfig.Name
+
+	if sliceSubnet == "" {
+		logger.Warnf("SliceConfig %s/%s has no SliceSubnet defined, skipping IPAM pool initialization.", sliceConfig.Namespace, sliceConfig.Name)
+		// Depending on your design, you might want to requeue with an error or status update
+		// if a missing SliceSubnet is a critical configuration error.
+	} else {
+		// Initialize the IPAM pool for this specific slice.
+		// This call is idempotent, meaning it's safe to call multiple times for the same slice
+		// without causing issues (it will only set up the pool if it doesn't exist).
+		err = s.ipam.InitializePool(sliceName, sliceSubnet)
+		if err != nil {
+			logger.Errorf("Failed to initialize IPAM pool for sliceConfig %s/%s %s: %v",
+				sliceConfig.Namespace, sliceConfig.Name, sliceSubnet, err)
+
+			return ctrl.Result{}, fmt.Errorf("failed to initialize IPAM pool: %w", err)
+		}
+		logger.Infof("Successfully initialized IPAM pool for sliceConfig %s/%s %s",
+			sliceConfig.Namespace, sliceConfig.Name, sliceSubnet)
+
+	}
 
 	if duplicate, value := util.CheckDuplicateInArray(sliceConfig.Spec.Clusters); duplicate {
 		logger.Infof("Duplicate cluster name %v found in sliceConfig %v", value, req.NamespacedName)

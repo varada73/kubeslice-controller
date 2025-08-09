@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,10 +61,12 @@ type IWorkerSliceGatewayService interface {
 
 // WorkerSliceGatewayService is a schema for interfaces JobService, WorkerSliceConfigService, SecretService
 type WorkerSliceGatewayService struct {
-	js   IJobService
-	sscs IWorkerSliceConfigService
-	sc   ISecretService
-	mf   metrics.IMetricRecorder
+	js     IJobService
+	sscs   IWorkerSliceConfigService
+	sc     ISecretService
+	mf     metrics.IMetricRecorder
+	ipam   IPAMAllocator
+	client client.Client // IPAMAllocator interface to allocate IPs for worker slice gateways
 }
 
 // WorkerSliceGatewayNetworkAddresses is a schema for WorkerSlice gateway network parameters
@@ -291,6 +295,20 @@ func (s *WorkerSliceGatewayService) DeleteWorkerSliceGatewaysByLabel(ctx context
 		WithSlice(label["original-slice-name"])
 
 	for _, gateway := range gateways {
+		// Before deleting the gateway, reclaim its IPAM allocation
+		sliceName := gateway.Spec.SliceName
+		clusterName := gateway.Spec.LocalGatewayConfig.ClusterName // Assuming local cluster IP needs to be reclaimed
+
+		if clusterName != "" && sliceName != "" {
+			err = s.ipam.Reclaim(ctx, sliceName, clusterName)
+			if err != nil {
+				util.CtxLogger(ctx).Errorf("Failed to reclaim IP for cluster %s in slice %s (gateway %s): %v", clusterName, sliceName, gateway.Name, err)
+				// Log the error but proceed with gateway deletion to avoid leaving orphaned gateways.
+			} else {
+				util.CtxLogger(ctx).Infof("Successfully reclaimed IP for cluster %s in slice %s (gateway %s)", clusterName, sliceName, gateway.Name)
+			}
+		}
+
 		err = util.DeleteResource(ctx, &gateway)
 		if err != nil {
 			//Register an event for worker slice gateway deletion failure
@@ -406,6 +424,18 @@ func (s *WorkerSliceGatewayService) cleanupObsoleteGateways(ctx context.Context,
 		clusterDestination := gateway.Spec.RemoteGatewayConfig.ClusterName
 		gatewayExpectedNumber := s.calculateGatewayNumber(clusterMap[clusterSource], clusterMap[clusterDestination])
 		if !clusterExistMap[clusterSource] || !clusterExistMap[clusterDestination] || gatewayExpectedNumber != gateway.Spec.GatewayNumber {
+			// This gateway is obsolete, reclaim its IP before deletion
+			sliceName := gateway.Spec.SliceName
+			if clusterSource != "" && sliceName != "" {
+				err = s.ipam.Reclaim(ctx, sliceName, clusterSource)
+				if err != nil {
+					util.CtxLogger(ctx).Errorf("Failed to reclaim IP for obsolete cluster %s in slice %s (gateway %s): %v", clusterSource, sliceName, gateway.Name, err)
+					// Log and continue, as the gateway still needs to be deleted.
+				} else {
+					util.CtxLogger(ctx).Infof("Successfully reclaimed IP for obsolete cluster %s in slice %s (gateway %s)", clusterSource, sliceName, gateway.Name)
+				}
+			}
+
 			err = util.DeleteResource(ctx, &gateway)
 			if err != nil {
 				//Register an event for worker slice gateway deletion failure
@@ -578,16 +608,86 @@ func (s *WorkerSliceGatewayService) createMinimumGateWayPairIfNotExists(ctx cont
 func (s *WorkerSliceGatewayService) BuildNetworkAddresses(sliceSubnet, sourceClusterName, destinationClusterName string,
 	clusterMap map[string]int, clusterCidr string) util.WorkerSliceGatewayNetworkAddresses {
 	gatewayAddresses := util.WorkerSliceGatewayNetworkAddresses{}
+	logger := util.CtxLogger(context.Background()) // Get logger
+
+	// Default CIDR size if annotation is not found
+	defaultSizeStr := strings.TrimPrefix(clusterCidr, "/")
+	defaultSize, parseErr := strconv.Atoi(defaultSizeStr)
+	if parseErr != nil {
+		logger.Error(parseErr, "Invalid default clusterCidr format, falling back to /24", "clusterCidr", clusterCidr)
+		defaultSize = 24 //hard-coded default CIDR size in edge case
+	}
+	// Fetch source cluster to get ClusterSubnetSizeAnnotation
+	sourceCluster := &controllerv1alpha1.Cluster{}
+	foundSource, err := util.GetResourceIfExist(context.Background(), client.ObjectKey{Name: sourceClusterName}, sourceCluster)
+	if err != nil {
+		logger.Errorf("Failed to get source cluster %s: %v", sourceClusterName, err)
+		return gatewayAddresses
+	}
+	sourceClusterCIDRSize := defaultSize
+	if foundSource && sourceCluster.Annotations != nil {
+		if sizeStr, ok := sourceCluster.Annotations[util.ClusterSubnetSizeAnnotation]; ok {
+			if size, convErr := strconv.Atoi(sizeStr); convErr == nil {
+				sourceClusterCIDRSize = size
+			} else {
+				logger.Warnf("Invalid %s annotation for cluster %s: %v. Using default /%d.", util.ClusterSubnetSizeAnnotation, sourceClusterName, convErr, defaultSize)
+			}
+		}
+	}
+
+	// Allocate subnet for source cluster
+	sourceClusterAllocatedSubnet, err := s.ipam.Allocate(context.Background(), sliceSubnet, sourceClusterName, sourceClusterCIDRSize)
+	if err != nil {
+		logger.Errorf("Failed to allocate IP for source cluster %s in slice %s: %v", sourceClusterName, sliceSubnet, err)
+		return gatewayAddresses
+	}
+
+	// Fetch destination cluster to get ClusterSubnetSizeAnnotation
+	destinationCluster := &controllerv1alpha1.Cluster{}
+	foundDest, err := util.GetResourceIfExist(context.Background(), client.ObjectKey{Name: destinationClusterName}, destinationCluster)
+	if err != nil {
+		logger.Errorf("Failed to get destination cluster %s: %v", destinationClusterName, err)
+		return gatewayAddresses
+	}
+	destinationClusterCIDRSize := defaultSize
+	if foundDest && destinationCluster.Annotations != nil {
+		if sizeStr, ok := destinationCluster.Annotations[util.ClusterSubnetSizeAnnotation]; ok {
+			if size, convErr := strconv.Atoi(sizeStr); convErr == nil {
+				destinationClusterCIDRSize = size
+			} else {
+				logger.Warnf("Invalid %s annotation for cluster %s: %v. Using default /%d.", util.ClusterSubnetSizeAnnotation, destinationClusterName, convErr, defaultSize)
+			}
+		}
+	}
+
+	// Allocate subnet for destination cluster
+	destinationClusterAllocatedSubnet, err := s.ipam.Allocate(context.Background(), sliceSubnet, destinationClusterName, destinationClusterCIDRSize)
+	if err != nil {
+		logger.Errorf("Failed to allocate IP for destination cluster %s in slice %s: %v", destinationClusterName, sliceSubnet, err)
+		return gatewayAddresses
+	}
+
+	// Parse the allocated subnets
+	_, serverNet, err := net.ParseCIDR(sourceClusterAllocatedSubnet)
+	if err != nil {
+		logger.Errorf("Failed to parse allocated server subnet %s: %v", sourceClusterAllocatedSubnet, err)
+		return gatewayAddresses
+	}
+	_, clientNet, err := net.ParseCIDR(destinationClusterAllocatedSubnet)
+	if err != nil {
+		logger.Errorf("Failed to parse allocated client subnet %s: %v", destinationClusterAllocatedSubnet, err)
+		return gatewayAddresses
+	}
+
+	gatewayAddresses.ServerNetwork = serverNet.IP.String()
+	gatewayAddresses.ClientNetwork = clientNet.IP.String()
+	gatewayAddresses.ServerSubnet = serverNet.String()
+	gatewayAddresses.ClientSubnet = clientNet.String()
+
 	ipr := strings.Split(sliceSubnet, ".")
-	serverSubnet := util.GetClusterPrefixPool(sliceSubnet, clusterMap[sourceClusterName], clusterCidr)
-	clientSubnet := util.GetClusterPrefixPool(sliceSubnet, clusterMap[destinationClusterName], clusterCidr)
-	gatewayAddresses.ServerNetwork = strings.SplitN(serverSubnet, "/", -1)[0]
-	gatewayAddresses.ClientNetwork = strings.SplitN(clientSubnet, "/", -1)[0]
-	gatewayAddresses.ServerSubnet = serverSubnet
-	gatewayAddresses.ClientSubnet = clientSubnet
-	gatewayAddresses.ServerVpnNetwork = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 255, "0")
-	gatewayAddresses.ServerVpnAddress = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 255, "1")
-	gatewayAddresses.ClientVpnAddress = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 255, "2")
+	gatewayAddresses.ServerVpnNetwork = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 0, "0")
+	gatewayAddresses.ServerVpnAddress = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 0, "1")
+	gatewayAddresses.ClientVpnAddress = fmt.Sprintf("%s.%s.%d.%s", ipr[0], ipr[1], 0, "2")
 	return gatewayAddresses
 }
 

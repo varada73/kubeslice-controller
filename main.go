@@ -58,27 +58,6 @@ func init() {
 }
 
 func main() {
-	// Compile time dependency injection
-	mr := service.WithMetricsRecorder()
-	ns := service.WithNameSpaceService(mr)
-	rp := service.WithAccessControlRuleProvider()
-	acs := service.WithAccessControlService(rp, mr)
-	js := service.WithJobService()
-	wscs := service.WithWorkerSliceConfigService(mr)
-	ss := service.WithSecretService(mr)
-	wsgs := service.WithWorkerSliceGatewayService(js, wscs, ss, mr)
-	c := service.WithClusterService(ns, acs, wsgs, mr)
-	wsi := service.WithWorkerServiceImportService(mr)
-	se := service.WithServiceExportConfigService(wsi, mr)
-	wsgrs := service.WithWorkerSliceGatewayRecyclerService()
-	vpn := service.WithVpnKeyRotationService(wsgs, wscs)
-	sc := service.WithSliceConfigService(ns, acs, wsgs, wscs, wsi, se, wsgrs, mr, vpn)
-	sqcs := service.WithSliceQoSConfigService(wscs, mr)
-	p := service.WithProjectService(ns, acs, c, sc, se, sqcs, mr)
-	initialize(service.WithServices(wscs, p, c, sc, se, wsgs, wsi, sqcs, wsgrs, vpn))
-}
-
-func initialize(services *service.Services) {
 	// get metrics address from env
 	var metricsAddr string
 	// get enableLeaderElection from env
@@ -159,6 +138,26 @@ func initialize(services *service.Services) {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+
+	// Compile time dependency injection is now done AFTER the manager is created.
+	mr := service.WithMetricsRecorder()
+	ns := service.WithNameSpaceService(mr)
+	rp := service.WithAccessControlRuleProvider()
+	acs := service.WithAccessControlService(rp, mr)
+	js := service.WithJobService()
+	wscs := service.WithWorkerSliceConfigService(mr)
+	ss := service.WithSecretService(mr)
+	wsgs := service.WithWorkerSliceGatewayService(js, wscs, ss, mr, mgr.GetClient())
+	c := service.WithClusterService(ns, acs, wsgs, mr)
+	wsi := service.WithWorkerServiceImportService(mr)
+	se := service.WithServiceExportConfigService(wsi, mr)
+	wsgrs := service.WithWorkerSliceGatewayRecyclerService()
+	vpn := service.WithVpnKeyRotationService(wsgs, wscs)
+	sc := service.WithSliceConfigService(ns, acs, wsgs, wscs, wsi, se, wsgrs, mr, vpn, mgr.GetClient())
+	sqcs := service.WithSliceQoSConfigService(wscs, mr)
+	p := service.WithProjectService(ns, acs, c, sc, se, sqcs, mr)
+	services := service.WithServices(wscs, p, c, sc, se, wsgs, wsi, sqcs, wsgrs, vpn)
+
 	//setting up the event recorder
 	eventRecorder := events.NewEventRecorder(mgr.GetClient(), mgr.GetScheme(), ossEvents.EventsMap, events.EventRecorderOptions{
 		Version:   "v1alpha1",
