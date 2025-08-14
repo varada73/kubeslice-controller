@@ -18,7 +18,6 @@ package service
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/kubeslice/kubeslice-controller/metrics"
@@ -253,7 +252,6 @@ func testWorkerSliceGatewayReconciliationDeleteForcefully(t *testing.T) {
 }
 
 func testCreateMinimumWorkerSliceGatewaysAlreadyExists(t *testing.T) {
-	fmt.Printf("\n\n\nRunning testCreateMinimumWorkerSliceGatewaysAlreadyExists\n")
 	_, _, _, workerSliceGatewayService, requestObj, clientMock, _, ctx, mMock, _ := setupWorkerSliceGatewayTest("slice_gateway", "namespace")
 	label := map[string]string{
 		"worker-cluster": "cluster-1",
@@ -327,9 +325,7 @@ func testCreateMinimumWorkerSliceGatewaysAlreadyExists(t *testing.T) {
 	//jobMock.On("CreateJob", ctx, requestObj.Namespace, "image", environment).Return(ctrl.Result{}, nil).Once()
 
 	result, err := workerSliceGatewayService.CreateMinimumWorkerSliceGateways(ctx, "red", clusterNames, requestObj.Namespace, label, clusterMap, "10.10.10.10/16", "/16", nil)
-	fmt.Printf("Result: %v, Error: %v\n", result, err)
 	expectedResult := ctrl.Result{}
-	fmt.Printf("Expected Result: %v\n", expectedResult)
 	require.NoError(t, nil)
 	require.Equal(t, result, expectedResult)
 	require.Nil(t, err)
@@ -338,7 +334,6 @@ func testCreateMinimumWorkerSliceGatewaysAlreadyExists(t *testing.T) {
 }
 
 func testCreateMinimumWorkerSliceGatewaysNotExists(t *testing.T) {
-	fmt.Printf("\n\n\nRunning testCreateMinimumWorkerSliceGatewaysNotExists\n")
 	_, _, jobMock, workerSliceGatewayService, requestObj, clientMock, _, ctx, mMock, _ := setupWorkerSliceGatewayTest("slice_gateway", "namespace")
 	label := map[string]string{
 		"worker-cluster": "cluster-1",

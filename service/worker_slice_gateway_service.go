@@ -55,7 +55,7 @@ type IWorkerSliceGatewayService interface {
 	GenerateCerts(ctx context.Context, sliceName, namespace, gatewayProtocol string,
 		serverGateway *v1alpha1.WorkerSliceGateway, clientGateway *v1alpha1.WorkerSliceGateway,
 		gatewayAddresses util.WorkerSliceGatewayNetworkAddresses) error
-	BuildNetworkAddresses(sliceSubnet, sourceClusterName, destinationClusterName string,
+	BuildNetworkAddresses(ctx context.Context, sliceSubnet, sourceClusterName, destinationClusterName string,
 		clusterMap map[string]int, clusterCidr string) util.WorkerSliceGatewayNetworkAddresses
 }
 
@@ -469,7 +469,9 @@ func (s *WorkerSliceGatewayService) cleanupObsoleteGateways(ctx context.Context,
 func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(ctx context.Context, sliceName string,
 	clusterNames []string, namespace string, ownerLabel map[string]string, clusterMap map[string]int,
 	sliceSubnet string, clusterCidr string, sliceGwSvcTypeMap map[string]*controllerv1alpha1.SliceGatewayServiceType) (ctrl.Result, error) {
+	fmt.Printf("Creating minimum gateways for slice %s in namespace %s with clusters %v\n", sliceName, namespace, clusterNames)
 	noClusters := len(clusterNames)
+	fmt.Printf("Number of clusters: %v\n", clusterNames)
 	logger := util.CtxLogger(ctx)
 	clusterMapping := map[string]*controllerv1alpha1.Cluster{}
 	for _, clusterName := range clusterNames {
@@ -480,11 +482,15 @@ func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(ctx context
 		}
 		clusterMapping[clusterName] = &cluster
 	}
+	fmt.Printf("1.Cluster mapping: %v\n", clusterMapping)
 	for i := 0; i < noClusters; i++ {
 		for j := i + 1; j < noClusters; j++ {
 			sourceCluster, destinationCluster := clusterMapping[clusterNames[i]], clusterMapping[clusterNames[j]]
+			fmt.Printf("2.Source cluster: %s, Destination cluster: %s\n", sourceCluster.Name, destinationCluster.Name)
 			gatewayNumber := s.calculateGatewayNumber(clusterMap[sourceCluster.Name], clusterMap[destinationCluster.Name])
-			gatewayAddresses := s.BuildNetworkAddresses(sliceSubnet, sourceCluster.Name, destinationCluster.Name, clusterMap, clusterCidr)
+			fmt.Printf("2.Gateway number for %s and %s: %d\n", sourceCluster.Name, destinationCluster.Name, gatewayNumber)
+			gatewayAddresses := s.BuildNetworkAddresses(ctx, sliceSubnet, clusterNames[i], clusterNames[j], clusterMap, clusterCidr)
+			fmt.Printf("2.Gateway addresses: %v\n", gatewayAddresses)
 			// determine the gateway svc parameters
 			sliceGwSvcType := defaultSliceGatewayServiceType
 			gwSvcProtocol := defaultSliceGatewayServiceProtocol
@@ -500,6 +506,7 @@ func (s *WorkerSliceGatewayService) createMinimumGatewaysIfNotExists(ctx context
 			}
 		}
 	}
+	fmt.Printf("3.Created minimum gateways for slice %s in namespace %s with clusters %v\n", sliceName, namespace, clusterNames)
 	return ctrl.Result{}, nil
 
 }
@@ -509,6 +516,7 @@ func (s *WorkerSliceGatewayService) createMinimumGateWayPairIfNotExists(ctx cont
 	sourceCluster *controllerv1alpha1.Cluster, destinationCluster *controllerv1alpha1.Cluster,
 	sliceName, namespace, gatewayConnType, gatewayProtocol string, label map[string]string, gatewayNumber int,
 	gatewayAddresses util.WorkerSliceGatewayNetworkAddresses) error {
+	fmt.Printf("/nCreating minimum gateway pair for slice %s between clusters %s and %s\n", sliceName, sourceCluster.Name, destinationCluster.Name)
 	serverGatewayName := fmt.Sprintf(gatewayName, sliceName, sourceCluster.Name, destinationCluster.Name)
 	clientGatewayName := fmt.Sprintf(gatewayName, sliceName, destinationCluster.Name, sourceCluster.Name)
 	gateway := v1alpha1.WorkerSliceGateway{}
@@ -605,28 +613,41 @@ func (s *WorkerSliceGatewayService) createMinimumGateWayPairIfNotExists(ctx cont
 }
 
 // buildNetworkAddresses - function generates the object of WorkerSliceGatewayNetworkAddresses
-func (s *WorkerSliceGatewayService) BuildNetworkAddresses(sliceSubnet, sourceClusterName, destinationClusterName string,
+func (s *WorkerSliceGatewayService) BuildNetworkAddresses(ctx context.Context, sliceSubnet, sourceClusterName, destinationClusterName string,
 	clusterMap map[string]int, clusterCidr string) util.WorkerSliceGatewayNetworkAddresses {
+	fmt.Printf("\n\n\nBuilding network addresses for slice %s between clusters %s and %s\n", sliceSubnet, sourceClusterName, destinationClusterName)
 	gatewayAddresses := util.WorkerSliceGatewayNetworkAddresses{}
-	logger := util.CtxLogger(context.Background()) // Get logger
+	fmt.Printf("Slice subnet: %s\n", sliceSubnet)
+	logger := util.CtxLogger(ctx) // Get logger
+	fmt.Printf("Source cluster: %s, Destination cluster: %s\n", sourceClusterName, destinationClusterName)
+
+	sliceSubnetSizeStr := strings.TrimPrefix(sliceSubnet, "/")
+	sliceSubnetSize, _ := strconv.Atoi(sliceSubnetSizeStr)
 
 	// Default CIDR size if annotation is not found
 	defaultSizeStr := strings.TrimPrefix(clusterCidr, "/")
+	fmt.Printf("Default CIDR size string: %s and clusterCidr %s\n", defaultSizeStr, clusterCidr)
 	defaultSize, parseErr := strconv.Atoi(defaultSizeStr)
-	if parseErr != nil {
+
+	if parseErr != nil || sliceSubnetSize <= defaultSize {
 		logger.Error(parseErr, "Invalid default clusterCidr format, falling back to /24", "clusterCidr", clusterCidr)
 		defaultSize = 24 //hard-coded default CIDR size in edge case
 	}
+	fmt.Printf("Default CIDR size: %d\n", defaultSize)
 	// Fetch source cluster to get ClusterSubnetSizeAnnotation
 	sourceCluster := &controllerv1alpha1.Cluster{}
-	foundSource, err := util.GetResourceIfExist(context.Background(), client.ObjectKey{Name: sourceClusterName}, sourceCluster)
+	foundSource, err := util.GetResourceIfExist(ctx, client.ObjectKey{Name: sourceClusterName}, sourceCluster)
 	if err != nil {
 		logger.Errorf("Failed to get source cluster %s: %v", sourceClusterName, err)
+		fmt.Printf("Failed to get source cluster %s: %v\n", sourceClusterName, err)
 		return gatewayAddresses
 	}
 	sourceClusterCIDRSize := defaultSize
+	fmt.Printf("Source cluster found: %v\n", foundSource)
+	fmt.Printf("Source cluster annotations: %v\n", sourceCluster.Annotations)
 	if foundSource && sourceCluster.Annotations != nil {
 		if sizeStr, ok := sourceCluster.Annotations[util.ClusterSubnetSizeAnnotation]; ok {
+			fmt.Printf("Source cluster annotation %s found with value %s\n", util.ClusterSubnetSizeAnnotation, sizeStr)
 			if size, convErr := strconv.Atoi(sizeStr); convErr == nil {
 				sourceClusterCIDRSize = size
 			} else {
@@ -634,17 +655,21 @@ func (s *WorkerSliceGatewayService) BuildNetworkAddresses(sliceSubnet, sourceClu
 			}
 		}
 	}
+	fmt.Printf("Source cluster CIDR size: %d\n", sourceClusterCIDRSize)
 
 	// Allocate subnet for source cluster
-	sourceClusterAllocatedSubnet, err := s.ipam.Allocate(context.Background(), sliceSubnet, sourceClusterName, sourceClusterCIDRSize)
+	sourceClusterAllocatedSubnet, err := s.ipam.Allocate(ctx, sliceSubnet, sourceClusterName, sourceClusterCIDRSize)
+
 	if err != nil {
+		fmt.Printf("Failed to allocate IP for source cluster %s in slice %s: %v\n", sourceClusterName, sliceSubnet, err)
 		logger.Errorf("Failed to allocate IP for source cluster %s in slice %s: %v", sourceClusterName, sliceSubnet, err)
 		return gatewayAddresses
 	}
+	fmt.Printf("Allocated subnet for source cluster %s: %s\n", sourceClusterName, sourceClusterAllocatedSubnet)
 
 	// Fetch destination cluster to get ClusterSubnetSizeAnnotation
 	destinationCluster := &controllerv1alpha1.Cluster{}
-	foundDest, err := util.GetResourceIfExist(context.Background(), client.ObjectKey{Name: destinationClusterName}, destinationCluster)
+	foundDest, err := util.GetResourceIfExist(ctx, client.ObjectKey{Name: destinationClusterName}, destinationCluster)
 	if err != nil {
 		logger.Errorf("Failed to get destination cluster %s: %v", destinationClusterName, err)
 		return gatewayAddresses
@@ -661,11 +686,12 @@ func (s *WorkerSliceGatewayService) BuildNetworkAddresses(sliceSubnet, sourceClu
 	}
 
 	// Allocate subnet for destination cluster
-	destinationClusterAllocatedSubnet, err := s.ipam.Allocate(context.Background(), sliceSubnet, destinationClusterName, destinationClusterCIDRSize)
+	destinationClusterAllocatedSubnet, err := s.ipam.Allocate(ctx, sliceSubnet, destinationClusterName, destinationClusterCIDRSize)
 	if err != nil {
 		logger.Errorf("Failed to allocate IP for destination cluster %s in slice %s: %v", destinationClusterName, sliceSubnet, err)
 		return gatewayAddresses
 	}
+	fmt.Printf("Allocated subnet for destination cluster %s: %s\n", destinationClusterName, destinationClusterAllocatedSubnet)
 
 	// Parse the allocated subnets
 	_, serverNet, err := net.ParseCIDR(sourceClusterAllocatedSubnet)

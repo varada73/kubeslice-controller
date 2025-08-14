@@ -59,22 +59,39 @@ func GetObjectKind(obj runtime.Object) string {
 // GetResourceIfExist is a function to get the given resource is in namespace
 func GetResourceIfExist(ctx context.Context, namespacedName client.ObjectKey, object client.Object) (bool,
 	error) {
+	fmt.Printf("Fetching Object of kind %s with name %s in namespace %s\n", GetObjectKind(object),
+		namespacedName.Name, namespacedName.Namespace)
+
 	logger := CtxLogger(ctx)
 	logger.Debugf("Fetching Object of kind %s with name %s in namespace %s", GetObjectKind(object),
 		namespacedName.Name, namespacedName.Namespace)
+
 	kubeSliceCtx := GetKubeSliceControllerRequestContext(ctx)
+	fmt.Printf("KubeSlice Context: %v\n", kubeSliceCtx)
 	err := kubeSliceCtx.Get(ctx, namespacedName, object)
 	if err != nil {
+		fmt.Printf("Error retrieving object of kind %s with name %s in namespace %s: %v\n", GetObjectKind(object),
+			namespacedName.Name, namespacedName.Namespace, err)
+		logger.With(zap.Error(err)).Errorf("Error retrieving object of kind %s with name %s in namespace %s",
+			GetObjectKind(object), namespacedName.Name, namespacedName.Namespace)
+		// If the object is not found, return nil error
 		if errors.IsNotFound(err) {
 			logger.Debugf("Object of kind %s with name %s in namespace %s not found", GetObjectKind(object),
 				namespacedName.Name, namespacedName.Namespace)
+			fmt.Printf("Object of kind %s with name %s in namespace %s not found\n", GetObjectKind(object),
+				namespacedName.Name, namespacedName.Namespace)
+			// Return false to indicate that the object does not exist
 			return false, nil
 		} else {
 			logger.With(zap.Error(err)).Errorf("Error retrieving object of kind %s with name %s in namespace %s",
 				GetObjectKind(object), namespacedName.Name, namespacedName.Namespace)
+			fmt.Printf("Error retrieving object of kind %s with name %s in namespace %s: %v\n", GetObjectKind(object),
+				namespacedName.Name, namespacedName.Namespace, err)
+			// Return the error if it is not a not found error
 			return false, err
 		}
 	}
+	fmt.Printf("No Error in KubeSlice Context")
 	return true, nil
 }
 

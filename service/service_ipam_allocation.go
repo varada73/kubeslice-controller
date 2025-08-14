@@ -8,60 +8,36 @@ import (
 	"sync"
 )
 
-// IPAMAllocator defines the interface for a dynamic IP address management system.
 type IPAMAllocator interface {
-	// InitializePool sets up a new IPAM pool for a given slice.
-	// It takes the overall slice subnet and the *maximum* expected cluster CIDR size.
 	InitializePool(sliceName, sliceSubnet string) error
-
-	// Allocate assigns an available subnet of the required CIDR size to a cluster within a slice.
-	// It is idempotent, returning the existing allocation if one is found.
 	Allocate(ctx context.Context, sliceName string, clusterName string, requiredCIDRSize int) (string, error)
-
-	// Reclaim returns a previously allocated subnet to the available pool.
 	Reclaim(ctx context.Context, sliceName string, clusterName string) error
 }
 
 // sliceIPPool holds the state for a single slice's IPAM.
 type sliceIPPool struct {
-	// The overall CIDR block for the slice (e.g., "10.1.0.0/16").
 	SliceSubnet *net.IPNet
-
 	// Mutex to protect concurrent access to this pool's state.
-	mu sync.Mutex
-
-	// AllocatedBlocks tracks subnets that are currently in use.
-	// Map: clusterName -> allocatedSubnetCIDR (as *net.IPNet).
-	Allocated map[string]*net.IPNet
-
-	// FreeBlocks is a list of available CIDR blocks.
-	// It's kept sorted by network address for easier merging and searching.
+	mu         sync.Mutex
+	Allocated  map[string]*net.IPNet
 	FreeBlocks []*net.IPNet
 }
 
-// DynamicIPAMAllocator implements the IPAMAllocator interface using in-memory storage.
-// In a production environment, this state would be persisted (e.g., in a CRD).
 type DynamicIPAMAllocator struct {
-	// Mutex to protect the top-level pools map.
-	mu sync.Mutex
-	// Map: sliceName -> *sliceIPPool.
+	mu    sync.Mutex
 	pools map[string]*sliceIPPool
 }
 
-// NewDynamicIPAMAllocator creates and returns a new instance of the allocator.
 func NewDynamicIPAMAllocator() *DynamicIPAMAllocator {
 	return &DynamicIPAMAllocator{
 		pools: make(map[string]*sliceIPPool),
 	}
 }
 
-// InitializePool sets up the IPAM pool for a given slice.
-// It parses the sliceSubnet and adds it as the initial free block.
 func (a *DynamicIPAMAllocator) InitializePool(sliceName, sliceSubnetStr string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// If the pool already exists, no need to re-initialize.
 	if _, exists := a.pools[sliceName]; exists {
 		return nil
 	}
@@ -78,10 +54,14 @@ func (a *DynamicIPAMAllocator) InitializePool(sliceName, sliceSubnetStr string) 
 	}
 
 	a.pools[sliceName] = pool
-	// Reserve a /24 subnet for VPN usage within the slice.
-	vpnSubnetRequiredSize := 24 //Allocate the VPN subnet with a /24 size
+	fmt.Printf("InitializePool: After creation, pool.Allocated for %s: %v\n", sliceName, pool.Allocated)
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	//Allocation if subnet for VPN is required for each slice even if it is not a cluster in the slice.
+	vpnSubnetRequiredSize := 24
+	vpnClusterName := "VPN_Subnet"
 
-	_, err = a.Allocate(context.Background(), sliceName, "KubeSlice-VPN-Reserved-Subnet", vpnSubnetRequiredSize)
+	_, err = pool.allocateSubnetForPool(vpnClusterName, vpnSubnetRequiredSize)
 	if err != nil {
 		return fmt.Errorf("failed to reserve VPN subnet for slice %s: %w", sliceName, err)
 	}
@@ -89,8 +69,7 @@ func (a *DynamicIPAMAllocator) InitializePool(sliceName, sliceSubnetStr string) 
 	return nil
 }
 
-// Allocate assigns a subnet of the required CIDR size to a cluster from the specified slice's pool.
-// It is thread-safe and idempotent.
+// Allocate allocates a subnet for a specific cluster within a slice.
 func (a *DynamicIPAMAllocator) Allocate(ctx context.Context, sliceName string, clusterName string, requiredCIDRSize int) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -103,86 +82,14 @@ func (a *DynamicIPAMAllocator) Allocate(ctx context.Context, sliceName string, c
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
-	// 1. Check if the cluster already has an allocation (idempotency).
-	if allocatedNet, found := pool.Allocated[clusterName]; found {
-		// If the existing allocation is the correct size, return it.
-		// If the size is different, this might indicate a configuration change.
-		// For simplicity in this PR, we assume the requested size matches the existing.
-		// A more robust system might re-allocate if sizes differ.
-		_, existingBits := allocatedNet.Mask.Size()
-		if existingBits == requiredCIDRSize {
-			return allocatedNet.String(), nil
-		}
-		// If size differs, we need to reclaim and re-allocate.
-		// This is a complex edge case for a first PR, so we'll treat it as an error for now.
-		return "", fmt.Errorf("cluster %s already has subnet %s (/%d), but requested /%d. Re-allocation not supported in this version.",
-			clusterName, allocatedNet.String(), existingBits, requiredCIDRSize)
+	allocatedNet, err := pool.allocateSubnetForPool(clusterName, requiredCIDRSize)
+	if err != nil {
+		return "", fmt.Errorf("failed to allocate subnet for cluster %s in slice %s: %w", clusterName, sliceName, err)
 	}
-
-	// 2. Find a suitable free block.
-	// We'll use a first-fit approach.
-	var bestFitIndex = -1
-	var bestFitNet *net.IPNet
-
-	for i, freeNet := range pool.FreeBlocks {
-		_, freeBits := freeNet.Mask.Size()
-		if freeBits <= requiredCIDRSize { // If free block is larger or equal to requested size
-			bestFitIndex = i
-			bestFitNet = freeNet
-			break // Found first fit
-		}
-	}
-
-	if bestFitIndex == -1 {
-		return "", fmt.Errorf("no available subnet of size /%d in pool for slice %s", requiredCIDRSize, sliceName)
-	}
-
-	// 4. Split the block if it's larger than needed.
-	_, bestFitBits := bestFitNet.Mask.Size()
-	var allocatedNet *net.IPNet
-	remainderNets := []*net.IPNet{}
-
-	if bestFitBits < requiredCIDRSize {
-
-		allocatedNet = &net.IPNet{IP: bestFitNet.IP, Mask: net.CIDRMask(requiredCIDRSize, 32)}
-
-		nextIP := make(net.IP, len(allocatedNet.IP)) // Use correct IP length
-		copy(nextIP, allocatedNet.IP)
-		incIP(nextIP, 1<<uint(32-requiredCIDRSize)) // Increment by the size of the allocated block
-
-		// Create a new IPNet for the remainder
-		if bestFitNet.Contains(nextIP) {
-			// Ensure the nextIP is still within the original bestFitNet
-			remainderNets = append(remainderNets, &net.IPNet{IP: nextIP, Mask: net.CIDRMask(requiredCIDRSize, 32)})
-		}
-		// Try to create further subnets for the remaining space
-		for i := requiredCIDRSize; i > bestFitBits-1; i-- {
-			nextTonextIP := make(net.IP, len(nextIP)) // Use correct IP length
-			copy(nextTonextIP, nextIP)
-			incIP(nextTonextIP, 1<<uint(32-i))
-			copy(nextIP, nextTonextIP) // Update nextIP for the next iteration
-			if bestFitNet.Contains(nextTonextIP) {
-				// Ensure the nextIP is still within the original bestFitNet
-				remainderNets = append(remainderNets, &net.IPNet{IP: nextTonextIP, Mask: net.CIDRMask(i, 32)})
-			}
-		}
-	} else if bestFitBits == requiredCIDRSize { // Exact fit
-		allocatedNet = bestFitNet
-	} else { // Exact fit
-		allocatedNet = bestFitNet
-	}
-
-	before := pool.FreeBlocks[:bestFitIndex]
-	after := pool.FreeBlocks[bestFitIndex:]
-	pool.FreeBlocks = append(append(before, remainderNets...), after...)
-
-	// 5. Store the new allocation.
-	pool.Allocated[clusterName] = allocatedNet
 
 	return allocatedNet.String(), nil
 }
 
-// Reclaim returns a subnet to the available pool for a specified cluster.
 // It attempts to merge the reclaimed block with adjacent free blocks to reduce fragmentation.
 func (a *DynamicIPAMAllocator) Reclaim(ctx context.Context, sliceName string, clusterName string) error {
 	a.mu.Lock()
@@ -196,25 +103,19 @@ func (a *DynamicIPAMAllocator) Reclaim(ctx context.Context, sliceName string, cl
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
-	// 1. Check if the cluster actually has a subnet to reclaim.
 	subnetToReclaim, allocated := pool.Allocated[clusterName]
 	if !allocated {
 		return fmt.Errorf("cluster %s has no allocated subnet in slice %s to reclaim", clusterName, sliceName)
 	}
 
-	// 2. Remove the allocation from the map.
 	delete(pool.Allocated, clusterName)
 
-	// 3. Add the reclaimed subnet back to the free list.
 	pool.FreeBlocks = append(pool.FreeBlocks, subnetToReclaim)
 
-	// 4. Attempt to merge adjacent free blocks (basic merge logic).
-	// Sort the free blocks to make merging easier.
 	sort.Slice(pool.FreeBlocks, func(i, j int) bool {
 		return compareIPNets(pool.FreeBlocks[i], pool.FreeBlocks[j]) < 0
 	})
 
-	// Iterate and merge
 	newFreeBlocks := []*net.IPNet{}
 	if len(pool.FreeBlocks) > 0 {
 		current := pool.FreeBlocks[0]
@@ -237,16 +138,130 @@ func (a *DynamicIPAMAllocator) Reclaim(ctx context.Context, sliceName string, cl
 
 // --- Helper Functions for IPNet Manipulation ---
 
-// compareIPNets compares two IPNet objects for sorting.
-// Returns -1 if a < b, 0 if a == b, 1 if a > b.
-// Compares by IP address first, then by mask size.
+func copyIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	out := make(net.IP, len(ip))
+	copy(out, ip)
+	return out
+}
+func (pool *sliceIPPool) allocateSubnetForPool(clusterName string, requiredCIDRSize int) (*net.IPNet, error) {
+
+	if allocatedNet, found := pool.Allocated[clusterName]; found {
+		ones, _ := allocatedNet.Mask.Size()
+		existingBits := ones
+		if existingBits == requiredCIDRSize {
+			return allocatedNet, nil
+		}
+
+		return nil, fmt.Errorf("cluster %s already has subnet %s (/%d), but requested /%d. Re-allocation not supported in this version.",
+			clusterName, allocatedNet.String(), existingBits, requiredCIDRSize)
+	}
+
+	var firstFitIndex = -1
+	var firstFitNet *net.IPNet
+
+	for i, freeNet := range pool.FreeBlocks {
+		ones, _ := freeNet.Mask.Size()
+		freeBits := ones
+		if freeBits <= requiredCIDRSize {
+			firstFitIndex = i
+			ipCopy := copyIP(freeNet.IP)
+			maskCopy := append(net.IPMask(nil), freeNet.Mask...)
+			firstFitNet = &net.IPNet{IP: ipCopy, Mask: maskCopy}
+			break
+		}
+	}
+
+	if firstFitIndex == -1 {
+		return nil, fmt.Errorf("no available subnet of size /%d in pool", requiredCIDRSize)
+	}
+
+	ones, _ := firstFitNet.Mask.Size()
+	firstFitBits := ones
+
+	var allocatedNet *net.IPNet
+	remainderNets := []*net.IPNet{}
+
+	if firstFitBits < requiredCIDRSize {
+
+		startIP := copyIP(firstFitNet.IP)
+		allocatedNet = &net.IPNet{IP: startIP, Mask: net.CIDRMask(requiredCIDRSize, 32)}
+
+		nextIP := copyIP(startIP)
+		nextIP = incIP(nextIP, 1<<uint(32-requiredCIDRSize))
+
+		if firstFitNet.Contains(nextIP) {
+			remainderNets = append(remainderNets, &net.IPNet{
+				IP:   copyIP(nextIP),
+				Mask: net.CIDRMask(requiredCIDRSize, 32),
+			})
+
+		}
+
+		for i := requiredCIDRSize; i > firstFitBits+1; i-- {
+			nextTonextIP := copyIP(nextIP)
+
+			nextTonextIP = incIP(nextTonextIP, 1<<uint(32-i))
+
+			copy(nextIP, nextTonextIP)
+			if firstFitNet.Contains(nextTonextIP) {
+				remainderNets = append(remainderNets, &net.IPNet{
+					IP:   copyIP(nextTonextIP),
+					Mask: net.CIDRMask(i-1, 32),
+				})
+
+			}
+		}
+	} else if firstFitBits == requiredCIDRSize { // Exact fit
+		allocatedNet = &net.IPNet{IP: copyIP(firstFitNet.IP), Mask: firstFitNet.Mask}
+	}
+
+	before := make([]*net.IPNet, 0, firstFitIndex)
+	before = append(before, pool.FreeBlocks[:firstFitIndex]...)
+
+	after := make([]*net.IPNet, 0, len(pool.FreeBlocks)-(firstFitIndex+1))
+	if firstFitIndex+1 < len(pool.FreeBlocks) {
+		after = append(after, pool.FreeBlocks[firstFitIndex+1:]...)
+	}
+
+	remainderCopy := make([]*net.IPNet, 0, len(remainderNets))
+	for _, r := range remainderNets {
+		if r == nil {
+			continue
+		}
+
+		ipCp := copyIP(r.IP)
+		maskCp := append(net.IPMask(nil), r.Mask...)
+		remainderCopy = append(remainderCopy, &net.IPNet{
+			IP:   ipCp,
+			Mask: maskCp,
+		})
+	}
+
+	newFree := make([]*net.IPNet, 0, len(before)+len(remainderCopy)+len(after))
+	newFree = append(newFree, before...)
+	newFree = append(newFree, remainderCopy...)
+	newFree = append(newFree, after...)
+
+	pool.FreeBlocks = newFree
+
+	pool.Allocated[clusterName] = &net.IPNet{
+		IP:   copyIP(allocatedNet.IP),
+		Mask: append(net.IPMask(nil), allocatedNet.Mask...),
+	}
+
+	return allocatedNet, nil
+}
+
 func compareIPs(a, b net.IP) int {
-	// Handle IPv4 and IPv6 compatibility
+
 	a4 := a.To4()
 	b4 := b.To4()
 
 	if a4 != nil && b4 != nil {
-		// Both are IPv4, compare byte by byte
+
 		for i := 0; i < net.IPv4len; i++ {
 			if a4[i] < b4[i] {
 				return -1
@@ -259,7 +274,7 @@ func compareIPs(a, b net.IP) int {
 	}
 
 	if a4 == nil && b4 == nil {
-		// Both are IPv6, compare byte by byte
+
 		for i := 0; i < net.IPv6len; i++ {
 			if a[i] < b[i] {
 				return -1
@@ -271,96 +286,79 @@ func compareIPs(a, b net.IP) int {
 		return 0
 	}
 
-	// One is IPv4 and the other is IPv6. IPv4 addresses, when mapped to IPv6,
-	// are typically smaller (start with leading zeros).
-	// If a is IPv4 and b is IPv6, a is "smaller".
-	// If a is IPv6 and b is IPv4, a is "larger".
 	if a4 != nil && b4 == nil {
-		return -1 // IPv4 is "smaller" than IPv6
+		return -1
 	}
 	if a4 == nil && b4 != nil {
-		return 1 // IPv6 is "larger" than IPv4
+		return 1
 	}
-	return 0 // Should not happen
+	return 0
 }
 func compareIPNets(a, b *net.IPNet) int {
 	cmp := compareIPs(a.IP, b.IP)
 	if cmp != 0 {
 		return cmp
 	}
-	_, bitsA := a.Mask.Size()
-	_, bitsB := b.Mask.Size()
+	onesA, _ := a.Mask.Size()
+	onesB, _ := b.Mask.Size()
+	bitsA := onesA
+	bitsB := onesB
 	if bitsA < bitsB {
-		return -1
+		return 1
 	}
 	if bitsA > bitsB {
-		return 1
+		return -1
 	}
 	return 0
 }
 
-// tryMerge attempts to merge two adjacent CIDR blocks into a larger one.
-// Returns the merged block and true if successful, otherwise nil and false.
-// This is a simplified merge that only works for perfect binary merges (e.g., /24 + /24 -> /23).
 func tryMerge(a, b *net.IPNet) (*net.IPNet, bool) {
-	// Must be IPv4
+
 	if a.IP.To4() == nil || b.IP.To4() == nil {
 		return nil, false
 	}
 
-	// Must have same mask size
-	_, bitsA := a.Mask.Size()
-	_, bitsB := b.Mask.Size()
+	bitsA, _ := a.Mask.Size()
+	bitsB, _ := b.Mask.Size()
 	if bitsA != bitsB {
 		return nil, false
 	}
 
-	// Calculate the potential merged CIDR size (one bit smaller)
 	mergedBits := bitsA - 1
-	if mergedBits < 0 { // Can't merge smaller than /0
+
+	if mergedBits < 0 {
 		return nil, false
 	}
 
-	// Calculate the network address of the potential merged block
 	mergedMask := net.CIDRMask(mergedBits, 32)
-	mergedIP := a.IP.Mask(mergedMask) // Masking 'a's IP with the new mask
 
-	// Check if both original blocks are contained within this potential merged block
-	potentialMergedNet := &net.IPNet{IP: mergedIP, Mask: mergedMask}
-	if potentialMergedNet.Contains(a.IP) && potentialMergedNet.Contains(b.IP) {
-		// Check if they are the two direct sub-blocks of the potential merged block
-		// This is the tricky part: they must be exactly the two halves.
-		// A simpler check: the second block's IP must be the first block's IP + (size of block)
+	potentialMergedNet := &net.IPNet{IP: a.IP, Mask: mergedMask}
 
-		// Calculate the size of a single block (e.g., for /24, it's 256 IPs)
-		blockSize := 1 << uint(32-bitsA)
+	blockSize := 1 << uint(32-bitsA)
 
-		// Calculate the expected IP of the second block if it were the direct successor
-		expectedNextIP := make(net.IP, len(a.IP))
-		copy(expectedNextIP, a.IP)
-		incIP(expectedNextIP, blockSize)
+	expectedNextIP := copyIP(a.IP)
+	expectedNextIP = incIP(expectedNextIP, blockSize)
 
-		if expectedNextIP.Equal(b.IP) {
-			return potentialMergedNet, true
-		}
+	if expectedNextIP.Equal(b.IP) {
+
+		return potentialMergedNet, true
 	}
 
 	return nil, false
 }
 
-// incIP increments an IP address by a given amount.
-func incIP(ip net.IP, inc int) {
+func incIP(ip net.IP, inc int) net.IP {
+
+	res := copyIP(ip)
+
 	carry := inc
-	for i := len(ip) - 1; i >= 0; i-- {
+	for i := len(res) - 1; i >= 0; i-- {
 		if carry == 0 {
 			break
 		}
-		sum := int(ip[i]) + carry
-		ip[i] = byte(sum % 256)
-
-		// The new carry for the next (more significant) byte is the sum divided by 256
+		sum := int(res[i]) + carry
+		res[i] = byte(sum % 256)
 		carry = sum / 256
-
 	}
-	inc >>= 8
+	return res
 }
